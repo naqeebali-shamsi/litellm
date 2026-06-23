@@ -87,6 +87,7 @@ from litellm.proxy.auth.ip_address_utils import IPAddressUtils
 from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper
 from litellm.proxy.utils import ProxyLogging
 from litellm.repositories.table_repositories import MCPServerRepository
+from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.custom_http import httpxSpecialProvider
 from litellm.types.mcp import MCPAuth, MCPStdioConfig
 from litellm.types.mcp_server.mcp_server_manager import (
@@ -328,6 +329,30 @@ def _deserialize_json_dict(data: Any) -> Optional[Dict[str, str]]:
     else:
         # Already a dictionary
         return data
+
+
+def _resolve_os_environ_in_static_headers(
+    static_headers: Optional[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
+    """Resolve ``os.environ/VAR`` references in DB-stored MCP static_headers.
+
+    static_headers persisted to the DB (e.g. saved via the Admin UI) skip the
+    ``os.environ/`` resolution that ``ProxyConfig._check_for_os_environ_vars``
+    applies to YAML config, so they were sent upstream verbatim (issue #31050).
+    Resolve them here to match the YAML path. Non-secret values are returned
+    unchanged, and an unset env var falls back to the original value rather than
+    nulling the header.
+    """
+    if not static_headers:
+        return static_headers
+    resolved: Dict[str, str] = {}
+    for key, value in static_headers.items():
+        if isinstance(value, str) and value.startswith("os.environ/"):
+            secret = get_secret_str(value)
+            resolved[key] = secret if secret is not None else value
+        else:
+            resolved[key] = value
+    return resolved
 
 
 def _deserialize_json_list(data: Any) -> Optional[List[Dict[str, Any]]]:
@@ -1060,8 +1085,8 @@ class MCPServerManager:
     ) -> MCPServer:
         _mcp_info: MCPInfo = mcp_server.mcp_info or {}
         env_dict = _deserialize_json_dict(getattr(mcp_server, "env", None))
-        static_headers_dict = _deserialize_json_dict(
-            getattr(mcp_server, "static_headers", None)
+        static_headers_dict = _resolve_os_environ_in_static_headers(
+            _deserialize_json_dict(getattr(mcp_server, "static_headers", None))
         )
         env_vars_list = self._resolve_env_vars_list(
             mcp_server,

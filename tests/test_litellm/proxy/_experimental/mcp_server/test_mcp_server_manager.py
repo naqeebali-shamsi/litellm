@@ -31,6 +31,7 @@ from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
     _deserialize_json_dict,
     _deserialize_json_list,
     _normalize_mcp_server_cost_info,
+    _resolve_os_environ_in_static_headers,
 )
 from litellm.proxy._types import (
     LiteLLM_MCPServerTable,
@@ -41,6 +42,38 @@ from litellm.proxy._types import (
 )
 from litellm.types.mcp import MCPAuth
 from litellm.types.mcp_server.mcp_server_manager import MCPOAuthMetadata, MCPServer
+
+
+def test_resolve_os_environ_in_static_headers(monkeypatch):
+    """os.environ/VAR static headers resolve to the env value (issue #31050)."""
+    monkeypatch.setenv("MCP_TEST_SECRET", "resolved-token")
+
+    resolved = _resolve_os_environ_in_static_headers(
+        {
+            "Authorization": "os.environ/MCP_TEST_SECRET",  # resolved
+            "X-Static": "literal-value",  # left untouched
+        }
+    )
+
+    assert resolved["Authorization"] == "resolved-token"
+    assert resolved["X-Static"] == "literal-value"
+
+
+def test_resolve_os_environ_in_static_headers_unset_var_keeps_literal(monkeypatch):
+    """An unset env var falls back to the original value, never None."""
+    monkeypatch.delenv("MCP_MISSING_SECRET", raising=False)
+
+    resolved = _resolve_os_environ_in_static_headers(
+        {"Authorization": "os.environ/MCP_MISSING_SECRET"}
+    )
+
+    assert resolved["Authorization"] == "os.environ/MCP_MISSING_SECRET"
+
+
+def test_resolve_os_environ_in_static_headers_none_and_empty_passthrough():
+    """None / empty headers pass through unchanged."""
+    assert _resolve_os_environ_in_static_headers(None) is None
+    assert _resolve_os_environ_in_static_headers({}) == {}
 
 
 def _reload_mcp_manager_module():
