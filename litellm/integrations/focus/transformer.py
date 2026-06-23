@@ -22,22 +22,37 @@ _TAG_KEYS = (
     "custom_llm_provider",
 )
 
+_REQUEST_TAGS_KEY = "request_tags"
 
-def _build_tags_expr(available_keys: list[str]) -> pl.Expr:
+
+def _build_tags_expr(tag_columns: list[str]) -> pl.Expr:
     """Build a Polars expression that produces a JSON Tags string per row.
 
     Uses ``pl.struct`` + ``map_elements`` to avoid materialising the entire
     DataFrame to a list of Python dicts.  The JSON serialisation callback
     still runs in Python (GIL-bound), but struct-packing and loop dispatch
     are handled by Polars' Rust engine.
+
+    Request-level tags arrive as a list column and are encoded as a JSON
+    array string so the Tags map stays a flat string-to-string object.
     """
 
-    def _struct_to_json(row: dict) -> str:
-        tags = {k: str(v) for k, v in row.items() if v is not None}
+    def _struct_to_json(row: dict[str, object]) -> str:
+        metadata = {
+            k: str(v)
+            for k, v in row.items()
+            if k != _REQUEST_TAGS_KEY and v is not None
+        }
+        request_tags = row.get(_REQUEST_TAGS_KEY)
+        tags = (
+            {**metadata, _REQUEST_TAGS_KEY: json.dumps(request_tags)}
+            if request_tags
+            else metadata
+        )
         return json.dumps(tags) if tags else "{}"
 
     return (
-        pl.struct(available_keys)
+        pl.struct(tag_columns)
         .map_elements(_struct_to_json, return_dtype=pl.String)
         .alias("Tags")
     )
@@ -54,9 +69,9 @@ class FocusTransformer:
             return pl.DataFrame(schema=self.schema)
 
         # Build Tags JSON from metadata columns using vectorized Polars expression
-        available_keys = [k for k in _TAG_KEYS if k in frame.columns]
-        if available_keys:
-            frame = frame.with_columns(_build_tags_expr(available_keys))
+        tag_columns = [k for k in (*_TAG_KEYS, _REQUEST_TAGS_KEY) if k in frame.columns]
+        if tag_columns:
+            frame = frame.with_columns(_build_tags_expr(tag_columns))
         else:
             frame = frame.with_columns(pl.lit("{}").alias("Tags"))
 

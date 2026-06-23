@@ -38,6 +38,55 @@ def test_should_include_organization_fields_in_tags():
     assert tags["team_id"] == "team-1"
 
 
+def test_should_include_request_tags_in_tags():
+    frame = pl.DataFrame(
+        {
+            "date": [date(2024, 1, 2)],
+            "spend": [1.25],
+            "api_requests": [1],
+            "api_key": ["hashed-key"],
+            "api_key_alias": ["prod-key"],
+            "model": ["gpt-4o"],
+            "model_group": ["gpt-4o"],
+            "custom_llm_provider": ["openai"],
+            "team_id": ["team-1"],
+            "team_alias": ["Platform"],
+            "request_tags": [["prod", "checkout"]],
+        }
+    )
+
+    normalized = FocusTransformer().transform(frame)
+
+    tags = json.loads(normalized["Tags"][0])
+    assert json.loads(tags["request_tags"]) == ["prod", "checkout"]
+    assert tags["team_id"] == "team-1"
+
+
+def test_should_omit_request_tags_when_empty():
+    frame = pl.DataFrame(
+        {
+            "date": [date(2024, 1, 2)],
+            "spend": [1.25],
+            "api_requests": [1],
+            "api_key": ["hashed-key"],
+            "api_key_alias": ["prod-key"],
+            "model": ["gpt-4o"],
+            "model_group": ["gpt-4o"],
+            "custom_llm_provider": ["openai"],
+            "team_id": ["team-1"],
+            "team_alias": ["Platform"],
+        }
+    ).with_columns(
+        pl.Series("request_tags", [None], dtype=pl.List(pl.String)),
+    )
+
+    normalized = FocusTransformer().transform(frame)
+
+    tags = json.loads(normalized["Tags"][0])
+    assert "request_tags" not in tags
+    assert tags["team_id"] == "team-1"
+
+
 def test_should_omit_missing_organization_fields_from_tags():
     frame = pl.DataFrame(
         {
