@@ -218,6 +218,158 @@ class TestTryShortCircuitSearch:
 # ---------------------------------------------------------------------------
 
 
+class TestShortCircuitQuerySource:
+    """The search query must come from the model's web_search tool call when
+    present (agentic clients like Claude Code), and fall back to the last user
+    message only when no tool-call query is available (standalone native
+    sub-requests from Claude Desktop / Cowork / Anthropic SDK)."""
+
+    @pytest.mark.asyncio
+    async def test_prefers_tool_call_query_over_last_user_message(self):
+        """Claude Code path: the model's web_search tool-call query differs from
+        the last user message. Both the executed search AND the echoed
+        server_tool_use.input.query must use the tool-call query, not the chat
+        text."""
+        logger = WebSearchInterceptionLogger(enabled_providers=["github_copilot"])
+
+        with patch.object(
+            logger, "_execute_search", new_callable=AsyncMock
+        ) as mock_search:
+            mock_search.return_value = ("search results", None)
+
+            result = await logger.try_short_circuit_search(
+                model="github_copilot/claude-sonnet-4",
+                messages=[
+                    {"role": "user", "content": "tell me about otters please"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "server_tool_use",
+                                "id": "srvtoolu_abc",
+                                "name": "web_search",
+                                "input": {"query": "sea otter conservation 2026"},
+                            }
+                        ],
+                    },
+                ],
+                tools=[
+                    {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+                ],
+                custom_llm_provider="github_copilot",
+            )
+
+        # Executed search used the tool-call query, NOT "tell me about otters please"
+        mock_search.assert_called_once_with("sea otter conservation 2026")
+
+        # Echoed server_tool_use block also carries the tool-call query
+        assert result is not None
+        server_tool_use = next(
+            b for b in result["content"] if b["type"] == "server_tool_use"
+        )
+        assert server_tool_use["input"]["query"] == "sea otter conservation 2026"
+
+    @pytest.mark.asyncio
+    async def test_prefers_most_recent_tool_call_query(self):
+        """When multiple web_search tool calls exist, the most recent one wins."""
+        logger = WebSearchInterceptionLogger(enabled_providers=["github_copilot"])
+
+        with patch.object(
+            logger, "_execute_search", new_callable=AsyncMock
+        ) as mock_search:
+            mock_search.return_value = ("search results", None)
+
+            await logger.try_short_circuit_search(
+                model="github_copilot/claude-sonnet-4",
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "server_tool_use",
+                                "id": "srvtoolu_1",
+                                "name": "web_search",
+                                "input": {"query": "first query"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "server_tool_use",
+                                "id": "srvtoolu_2",
+                                "name": "web_search",
+                                "input": {"query": "second query"},
+                            }
+                        ],
+                    },
+                ],
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                custom_llm_provider="github_copilot",
+            )
+
+        mock_search.assert_called_once_with("second query")
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_last_user_message_when_no_tool_call(self):
+        """Standalone native sub-request (no assistant tool_use block): the last
+        user message IS the search query, so the fallback must be used."""
+        logger = WebSearchInterceptionLogger(enabled_providers=["github_copilot"])
+
+        with patch.object(
+            logger, "_execute_search", new_callable=AsyncMock
+        ) as mock_search:
+            mock_search.return_value = ("search results", None)
+
+            result = await logger.try_short_circuit_search(
+                model="github_copilot/claude-sonnet-4",
+                messages=[{"role": "user", "content": "latest python release notes"}],
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                custom_llm_provider="github_copilot",
+            )
+
+        mock_search.assert_called_once_with("latest python release notes")
+        assert result is not None
+        server_tool_use = next(
+            b for b in result["content"] if b["type"] == "server_tool_use"
+        )
+        assert server_tool_use["input"]["query"] == "latest python release notes"
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_websearch_tool_calls(self):
+        """A non-web_search tool_use block must not be treated as the query
+        source; extraction falls back to the last user message."""
+        logger = WebSearchInterceptionLogger(enabled_providers=["github_copilot"])
+
+        with patch.object(
+            logger, "_execute_search", new_callable=AsyncMock
+        ) as mock_search:
+            mock_search.return_value = ("search results", None)
+
+            await logger.try_short_circuit_search(
+                model="github_copilot/claude-sonnet-4",
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_x",
+                                "name": "Read",
+                                "input": {"query": "not a search query"},
+                            }
+                        ],
+                    },
+                    {"role": "user", "content": "the fallback query"},
+                ],
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                custom_llm_provider="github_copilot",
+            )
+
+        mock_search.assert_called_once_with("the fallback query")
+
+
 # ---------------------------------------------------------------------------
 # Integration with entry point
 # ---------------------------------------------------------------------------

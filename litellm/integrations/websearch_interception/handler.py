@@ -150,12 +150,27 @@ class WebSearchInterceptionLogger(CustomLogger):
         if not all(is_web_search_tool(t) for t in tools):
             return None
 
-        # Extract search query from the last user message
-        from litellm.litellm_core_utils.prompt_templates.common_utils import (
-            get_last_user_message,
-        )
+        # Prefer the query the model placed in its web_search tool call.
+        #
+        # Agentic clients (e.g. Claude Code) resolve web_search on the client
+        # side: the model emits a web_search tool_use whose ``input.query`` is
+        # the *actual* search string, and the client re-sends the conversation
+        # (carrying that tool_use block) for execution. The last user message
+        # is unrelated surrounding chat text, so searching it returns the wrong
+        # results and the client reports "Did 0 searches". Read the tool-call
+        # query from ``messages`` when present.
+        #
+        # Fall back to the last user message for standalone native sub-requests
+        # (Claude Desktop / Cowork / Anthropic SDK) that have no assistant
+        # tool_use block — there the last user message *is* the search query
+        # (see the native-client note below).
+        query = self._extract_web_search_tool_call_query(messages)
+        if not query:
+            from litellm.litellm_core_utils.prompt_templates.common_utils import (
+                get_last_user_message,
+            )
 
-        query = get_last_user_message(cast(List[AllMessageValues], messages))
+            query = get_last_user_message(cast(List[AllMessageValues], messages))
         if not query:
             return None
 
@@ -224,6 +239,47 @@ class WebSearchInterceptionLogger(CustomLogger):
             f"native_blocks={native_tool is not None})"
         )
         return response
+
+    @staticmethod
+    def _extract_web_search_tool_call_query(
+        messages: List[Dict],
+    ) -> Optional[str]:
+        """Return the query from the most recent web_search tool call, if any.
+
+        Agentic clients (e.g. Claude Code) carry the model's web_search tool
+        call in an assistant message as a ``tool_use`` / ``server_tool_use``
+        content block. Its ``input.query`` is the real search string — unlike
+        the last user message, which is unrelated conversation text.
+
+        Scans ``messages`` newest-first and returns the ``input.query`` of the
+        first assistant web_search tool-use block found. Web-search tool calls
+        are matched by name (``web_search``, ``litellm_web_search``, the legacy
+        ``WebSearch``) to avoid picking up unrelated tool calls. Returns None
+        when no such block carries a non-empty string query.
+        """
+        web_search_tool_names = {"web_search", "litellm_web_search", "WebSearch"}
+        tool_use_types = {"tool_use", "server_tool_use"}
+
+        for message in reversed(messages):
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") not in tool_use_types:
+                    continue
+                if block.get("name") not in web_search_tool_names:
+                    continue
+                tool_input = block.get("input")
+                if not isinstance(tool_input, dict):
+                    continue
+                query = tool_input.get("query")
+                if isinstance(query, str) and query.strip():
+                    return query
+        return None
 
     async def async_pre_call_deployment_hook(
         self, kwargs: Dict[str, Any], call_type: Optional[Any]
