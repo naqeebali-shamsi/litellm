@@ -229,6 +229,23 @@ def _should_strip_caller_authorization(
     )
 
 
+def _server_resolves_per_user_oauth(mcp_server: MCPServer) -> bool:
+    """Whether ``mcp_server`` resolves a stored per-user OAuth (authorization_code)
+    token downstream, inside ``_create_mcp_client``'s v2 credential resolver.
+
+    For these servers the user's OAuth access token is injected after the
+    ``hook_extra_headers`` merge, so a hook-injected ``Authorization`` (e.g. the
+    MCP JWT signer) must not be applied — it would shadow the resolved per-user
+    token. Mirrors the ``authorization_code`` arm of
+    ``_should_strip_caller_authorization`` and the tools/list guard, which both
+    give per-user OAuth precedence over injected credentials.
+    """
+    if mcp_server.auth_type != MCPAuth.oauth2 or mcp_server.has_client_credentials:
+        return False
+    spec = to_server_spec(mcp_server)
+    return spec is not None and isinstance(spec.config, AuthorizationCodeConfig)
+
+
 def _without_authorization(
     headers: Optional[dict[str, str]],
 ) -> Optional[dict[str, str]]:
@@ -3261,12 +3278,34 @@ class MCPServerManager:
             if extra_headers is None:
                 extra_headers = {}
             if "Authorization" in hook_extra_headers:
-                if "Authorization" in extra_headers:
-                    verbose_logger.warning(
-                        "MCPServerManager: hook_extra_headers 'Authorization' will overwrite "
-                        "the existing Authorization header from static_headers. "
-                        "The hook JWT will take precedence."
+                existing_auth_key = next(
+                    (key for key in extra_headers if key.lower() == "authorization"),
+                    None,
+                )
+                # A per-user OAuth (authorization_code) server resolves the stored
+                # user token later, inside _create_mcp_client. That resolved token
+                # never reaches this merge point, so guard against it explicitly:
+                # the hook JWT must not shadow it (an Authorization already in
+                # extra_headers would otherwise make the resolver defer — see the
+                # "Do not override an Authorization already supplied" branch).
+                resolves_per_user_oauth = _server_resolves_per_user_oauth(mcp_server)
+                if existing_auth_key is not None or resolves_per_user_oauth:
+                    # An Authorization is already present in extra_headers (a
+                    # per-user OAuth access token from oauth2_headers or an
+                    # admin-configured static Authorization) OR the server resolves
+                    # a per-user OAuth token downstream. Per-user OAuth and
+                    # admin-configured auth must take precedence, so do NOT let the
+                    # hook JWT overwrite/shadow it. This mirrors the tools/list path,
+                    # where the JWT signer skips injection entirely when an
+                    # Authorization is (or will be) present (see _get_tools_from_server).
+                    verbose_logger.debug(
+                        "MCPServerManager: hook_extra_headers 'Authorization' NOT applied — "
+                        "per-user OAuth or an admin-configured Authorization takes "
+                        "precedence. Dropping the hook JWT for this header."
                     )
+                    hook_extra_headers = {
+                        key: value for key, value in hook_extra_headers.items() if key.lower() != "authorization"
+                    }
                 elif server_auth_header is not None:
                     # server_auth_header is passed separately to _create_mcp_client as
                     # auth_value.  Both will reach the upstream server — warn so admins

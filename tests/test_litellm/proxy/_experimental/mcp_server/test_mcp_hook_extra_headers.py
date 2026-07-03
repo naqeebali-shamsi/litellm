@@ -536,14 +536,22 @@ class TestHookHeaderMergePriority:
         )
 
     @pytest.mark.asyncio
-    async def test_hook_headers_override_static_headers(self):
-        """Hook headers should take precedence over static_headers."""
+    async def test_hook_headers_preserve_existing_static_authorization(self):
+        """A pre-existing static Authorization header must take precedence over the hook JWT.
+
+        This mirrors the tools/list path (_get_tools_from_server), which skips
+        JWT injection when a static Authorization header is already configured.
+        The hook's non-Authorization headers are still merged through.
+        """
         manager = MCPServerManager()
         server = self._make_server(
             static_headers={"Authorization": "Bearer static-token", "X-Static": "yes"}
         )
 
-        hook_headers = {"Authorization": "Bearer hook-signed-jwt"}
+        hook_headers = {
+            "Authorization": "Bearer hook-signed-jwt",
+            "X-Trace-Id": "trace-123",
+        }
 
         captured_extra_headers: Dict[str, Any] = {}
 
@@ -576,8 +584,11 @@ class TestHookHeaderMergePriority:
                     pass
 
         headers = captured_extra_headers.get("value", {})
-        assert headers["Authorization"] == "Bearer hook-signed-jwt"
+        # Existing static Authorization is preserved; hook JWT does NOT overwrite it.
+        assert headers["Authorization"] == "Bearer static-token"
         assert headers["X-Static"] == "yes"
+        # Non-Authorization hook headers are still merged through.
+        assert headers["X-Trace-Id"] == "trace-123"
 
     @pytest.mark.asyncio
     async def test_no_hook_headers_preserves_existing_behavior(self):
@@ -619,8 +630,18 @@ class TestHookHeaderMergePriority:
         assert headers == {"X-Static": "static-value"}
 
     @pytest.mark.asyncio
-    async def test_hook_headers_merge_with_oauth2(self):
-        """Hook headers merge on top of OAuth2 headers."""
+    async def test_hook_jwt_not_injected_for_per_user_oauth_server(self):
+        """Per-user OAuth (authorization_code) must take precedence over the hook JWT (#31977).
+
+        Regression test for the tools/call bug. For a per-user OAuth
+        (authorization_code) server the stored user token is resolved
+        downstream, inside _create_mcp_client, and never reaches this merge
+        point. The JWT signer (pre_mcp_call guardrail) must therefore NOT inject
+        its Authorization header into extra_headers — otherwise it would shadow
+        the resolved per-user OAuth token (an Authorization already present in
+        extra_headers makes the credential resolver defer). This mirrors the
+        already-fixed tools/list path. Non-Authorization hook headers still merge.
+        """
         manager = MCPServerManager()
         server = MCPServer(
             server_id="test-id",
@@ -653,10 +674,7 @@ class TestHookHeaderMergePriority:
                         tasks=[],
                         mcp_auth_header=None,
                         mcp_server_auth_headers=None,
-                        oauth2_headers={
-                            "Authorization": "Bearer oauth2-token",
-                            "X-OAuth": "yes",
-                        },
+                        oauth2_headers={"Authorization": "Bearer oauth2-token"},
                         raw_headers=None,
                         proxy_logging_obj=None,
                         hook_extra_headers={
@@ -667,10 +685,108 @@ class TestHookHeaderMergePriority:
                 except Exception:
                     pass
 
+        headers = captured_extra_headers.get("value") or {}
+        # The hook JWT must NOT be present — the per-user OAuth token (resolved
+        # downstream in _create_mcp_client) takes precedence.
+        assert headers.get("Authorization") != "Bearer hook-jwt"
+        assert "Authorization" not in headers
+        # Non-Authorization hook headers are still merged.
+        assert headers.get("X-Trace-Id") == "trace-123"
+
+    @pytest.mark.asyncio
+    async def test_hook_jwt_injected_when_no_preexisting_authorization(self):
+        """JWT IS injected on tools/call when no OAuth/static Authorization exists.
+
+        Complements the precedence tests: with no pre-existing Authorization,
+        the hook JWT must still be applied so zero-trust signing keeps working.
+        """
+        manager = MCPServerManager()
+        server = self._make_server()  # auth_type=none, no static Authorization
+
+        captured_extra_headers: Dict[str, Any] = {}
+
+        async def fake_create_mcp_client(
+            server, mcp_auth_header=None, extra_headers=None, stdio_env=None, **kwargs
+        ):
+            captured_extra_headers["value"] = extra_headers
+            mock_client = MagicMock()
+            mock_client.call_tool = AsyncMock(return_value=MagicMock())
+            return mock_client
+
+        with patch.object(
+            manager, "_create_mcp_client", side_effect=fake_create_mcp_client
+        ):
+            with patch.object(manager, "_build_stdio_env", return_value=None):
+                try:
+                    await manager._call_regular_mcp_tool(
+                        mcp_server=server,
+                        original_tool_name="test_tool",
+                        arguments={"key": "val"},
+                        tasks=[],
+                        mcp_auth_header=None,
+                        mcp_server_auth_headers=None,
+                        oauth2_headers=None,
+                        raw_headers=None,
+                        proxy_logging_obj=None,
+                        hook_extra_headers={
+                            "Authorization": "Bearer hook-signed-jwt",
+                            "X-Trace-Id": "trace-123",
+                        },
+                    )
+                except Exception:
+                    pass
+
         headers = captured_extra_headers.get("value", {})
-        assert headers["Authorization"] == "Bearer hook-jwt"
-        assert headers["X-OAuth"] == "yes"
+        assert headers["Authorization"] == "Bearer hook-signed-jwt"
         assert headers["X-Trace-Id"] == "trace-123"
+
+    @pytest.mark.asyncio
+    async def test_hook_headers_preserve_case_insensitive_authorization(self):
+        """Precedence guard is case-insensitive on the existing Authorization key.
+
+        static_headers may carry a lowercase 'authorization'; the hook JWT must
+        still be dropped so the pre-existing credential is preserved and no
+        duplicate Authorization header is emitted.
+        """
+        manager = MCPServerManager()
+        server = self._make_server(
+            static_headers={"authorization": "Bearer static-lower"}
+        )
+
+        captured_extra_headers: Dict[str, Any] = {}
+
+        async def fake_create_mcp_client(
+            server, mcp_auth_header=None, extra_headers=None, stdio_env=None, **kwargs
+        ):
+            captured_extra_headers["value"] = extra_headers
+            mock_client = MagicMock()
+            mock_client.call_tool = AsyncMock(return_value=MagicMock())
+            return mock_client
+
+        with patch.object(
+            manager, "_create_mcp_client", side_effect=fake_create_mcp_client
+        ):
+            with patch.object(manager, "_build_stdio_env", return_value=None):
+                try:
+                    await manager._call_regular_mcp_tool(
+                        mcp_server=server,
+                        original_tool_name="test_tool",
+                        arguments={"key": "val"},
+                        tasks=[],
+                        mcp_auth_header=None,
+                        mcp_server_auth_headers=None,
+                        oauth2_headers=None,
+                        raw_headers=None,
+                        proxy_logging_obj=None,
+                        hook_extra_headers={"Authorization": "Bearer hook-jwt"},
+                    )
+                except Exception:
+                    pass
+
+        headers = captured_extra_headers.get("value", {})
+        # Pre-existing lowercase authorization preserved; no uppercase JWT added.
+        assert headers.get("authorization") == "Bearer static-lower"
+        assert "Authorization" not in headers
 
     @pytest.mark.asyncio
     async def test_m2m_oauth2_does_not_forward_litellm_caller_authorization(self):
