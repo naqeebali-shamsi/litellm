@@ -438,7 +438,18 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
         if prefix_path:
             prefix_path += "/"
 
-        s3_file_name = litellm.utils.get_logging_id(start_time, standard_logging_payload) or ""
+        # Derive the object key / download filename from the same id that the
+        # proxy uses for `LiteLLM_SpendLogs.request_id` (the `litellm_call_id`),
+        # so the S3 object name can be joined back to the DB row. The provider
+        # response id (e.g. Anthropic's `msg_...`) differs from `request_id` on
+        # the `/v1/messages` path, which previously made filenames unjoinable.
+        # `standard_logging_payload["id"]` mirrors `response_obj.get("id") or
+        # litellm_call_id`, so it is the correct fallback when `litellm_call_id`
+        # is not populated (e.g. some non-proxy SDK paths). The provider id is
+        # still preserved in the payload body under `id`.
+        logging_id = standard_logging_payload.get("litellm_call_id") or standard_logging_payload["id"]
+
+        s3_file_name = litellm.utils.get_logging_id(start_time, {"id": logging_id}) or ""
         verbose_logger.debug(
             f"Creating s3 file with prefix_components={prefix_components},prefix_path={prefix_path} and {s3_file_name}"
         )
@@ -450,9 +461,7 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
         )
         verbose_logger.debug(f"s3_object_key={s3_object_key}")
 
-        s3_object_download_filename = (
-            f"time-{start_time.strftime('%Y-%m-%dT%H-%M-%S-%f')}_{standard_logging_payload['id']}.json"
-        )
+        s3_object_download_filename = f"time-{start_time.strftime('%Y-%m-%dT%H-%M-%S-%f')}_{logging_id}.json"
 
         return s3BatchLoggingElement(
             payload=dict(standard_logging_payload),

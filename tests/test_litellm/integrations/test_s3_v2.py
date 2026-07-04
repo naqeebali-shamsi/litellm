@@ -1347,3 +1347,68 @@ def test_s3_server_side_encryption_read_from_callback_params():
         assert logger.s3_server_side_encryption == "aws:kms"
     finally:
         litellm.s3_callback_params = original
+
+
+# --------------------------------------------------------------
+# Regression test for #32028 — S3 object name must match DB request_id
+# --------------------------------------------------------------
+def test_s3_object_key_uses_litellm_call_id_for_request_id_join():
+    """
+    For the anthropic_messages (`/v1/messages`) path, `LiteLLM_SpendLogs.request_id`
+    resolves to `litellm_call_id`, while `standard_logging_payload["id"]` keeps the
+    provider response id (Anthropic's `msg_...`). The S3 object key and the
+    Content-Disposition download filename must be derived from `litellm_call_id`
+    so the stored object can be joined back to its DB row.
+
+    Regression test for https://github.com/BerriAI/litellm/issues/32028
+    """
+    provider_response_id = "msg_01AbCdEfGhIjKlMnOpQrStUv"  # Anthropic provider id
+    litellm_call_id = "1234abcd-5678-90ef-ghij-klmnopqrstuv"  # == DB request_id
+
+    logger = S3Logger(s3_bucket_name="test-bucket", s3_region_name="us-east-1")
+
+    payload = StandardLoggingPayload(
+        id=provider_response_id,
+        litellm_call_id=litellm_call_id,
+        call_type="anthropic_messages",
+        metadata={},
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+    )
+
+    result = logger.create_s3_batch_logging_element(datetime.utcnow(), payload)
+    assert result is not None
+
+    # The S3 object key (the stored file name) must contain the litellm_call_id
+    # (== request_id), not the provider msg_... id.
+    assert litellm_call_id in result.s3_object_key
+    assert provider_response_id not in result.s3_object_key
+
+    # The Content-Disposition download filename must likewise use litellm_call_id.
+    assert result.s3_object_download_filename.endswith(f"_{litellm_call_id}.json")
+    assert provider_response_id not in result.s3_object_download_filename
+
+    # The provider response id is still preserved in the payload body.
+    assert result.payload["id"] == provider_response_id
+
+
+def test_s3_object_key_falls_back_to_payload_id_without_litellm_call_id():
+    """
+    When `litellm_call_id` is not populated (e.g. some non-proxy SDK paths),
+    the S3 object key/filename fall back to `standard_logging_payload["id"]`,
+    preserving prior behavior.
+    """
+    payload_id = "chatcmpl-abc123"
+
+    logger = S3Logger(s3_bucket_name="test-bucket", s3_region_name="us-east-1")
+
+    payload = StandardLoggingPayload(
+        id=payload_id,
+        litellm_call_id=None,
+        metadata={},
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+    )
+
+    result = logger.create_s3_batch_logging_element(datetime.utcnow(), payload)
+    assert result is not None
+    assert payload_id in result.s3_object_key
+    assert payload_id in result.s3_object_download_filename
