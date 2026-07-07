@@ -6585,3 +6585,60 @@ async def test_debug_sso_callback_handles_missing_raw_response():
     assert '"raw_claims": {}' in body
     assert '"access_token_claims": {}' in body
     assert "user@example.com" in body
+
+
+def _get_cookie_path_from_set_cookie(headers) -> str:
+    """Extract the Path attribute from the 'token' Set-Cookie header."""
+    for name, value in headers.raw:
+        if name == b"set-cookie" and value.startswith(b"token="):
+            for attr in value.decode().split("; "):
+                if attr.lower().startswith("path="):
+                    return attr.split("=", 1)[1]
+    raise AssertionError("token Set-Cookie header not found")
+
+
+@pytest.mark.parametrize(
+    "server_root_path, expected_cookie_path",
+    [
+        # SERVER_ROOT_PATH unset -> cookie scoped to "/" (previous behavior).
+        ("", "/"),
+        # SERVER_ROOT_PATH set -> cookie scoped to the root path so two
+        # deployments on the same host don't overwrite each other's token.
+        ("/litellm", "/litellm"),
+    ],
+)
+def test_sso_token_cookie_path_matches_server_root_path(
+    server_root_path, expected_cookie_path
+):
+    """
+    Regression test for https://github.com/BerriAI/litellm/issues/32249
+
+    The SSO auth-callback token cookie must be scoped to SERVER_ROOT_PATH.
+    When a bare deployment (path "/") and a sub-path deployment
+    (e.g. "/litellm") share a host, a token cookie set at "/" by both
+    collides, breaking login. Scoping the cookie to the server root path
+    keeps the two deployments' cookies isolated.
+
+    This mirrors the exact logic in
+    SSOAuthenticationHandler.get_redirect_response_from_openid:
+        cookie_path = get_server_root_path() or "/"
+        redirect_response.set_cookie(key="token", value=..., path=cookie_path)
+    """
+    from fastapi.responses import RedirectResponse
+
+    from litellm.proxy.utils import get_server_root_path
+
+    env = {"SERVER_ROOT_PATH": server_root_path} if server_root_path else {}
+    with patch.dict(os.environ, env, clear=True):
+        cookie_path = get_server_root_path() or "/"
+        assert cookie_path == expected_cookie_path
+
+        redirect_response = RedirectResponse(url="/ui/?login=success", status_code=303)
+        redirect_response.set_cookie(
+            key="token", value="fake.jwt.token", path=cookie_path
+        )
+
+    assert (
+        _get_cookie_path_from_set_cookie(redirect_response.headers)
+        == expected_cookie_path
+    )

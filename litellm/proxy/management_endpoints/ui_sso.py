@@ -3376,7 +3376,15 @@ class SSOAuthenticationHandler:
             litellm_dashboard_ui += "?login=success"
         verbose_proxy_logger.info(f"Redirecting to {litellm_dashboard_ui}")
         redirect_response = RedirectResponse(url=litellm_dashboard_ui, status_code=303)
-        redirect_response.set_cookie(key="token", value=jwt_token)
+        # Scope the auth cookie to SERVER_ROOT_PATH so two deployments on the
+        # same host (one at "/" and one under a sub-path like "/litellm") do not
+        # share/overwrite each other's "token" cookie. When SERVER_ROOT_PATH is
+        # unset, get_server_root_path() returns "" and we fall back to "/",
+        # preserving the previous default behavior. The UI is served under the
+        # same root path (e.g. "/litellm/ui"), so a cookie scoped to the root
+        # path is still sent for the dashboard's requests.
+        cookie_path = get_server_root_path() or "/"
+        redirect_response.set_cookie(key="token", value=jwt_token, path=cookie_path)
         return redirect_response
 
     @staticmethod
